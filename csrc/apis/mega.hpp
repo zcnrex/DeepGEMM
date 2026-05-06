@@ -85,9 +85,23 @@ get_symm_buffer_size_for_mega_moe(
     const bool host_use_fp4_acts = with_sf and get_env<int>("DG_USE_FP4_ACTS") != 0;
     const int input_token_bytes = host_use_fp4_acts ? (hidden / 2) : hidden * num_mma_elem_bytes;
 
+    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the combine slot
+    // holds FP8 E4M3 (kHidden bytes/token) + a separate combine_sf slot
+    // holding UE8M0 SF bytes (kHidden/128 bytes/token, gran_k=128). When off,
+    // the combine slot holds BF16 (kHidden*2 bytes/token) and combine_sf is
+    // unused (zero-sized).
+    const bool host_use_fp8_combine = with_sf and get_env<int>("DG_USE_FP8_COMBINE") != 0;
+    constexpr int kCombineGranK = 128;
+    const int combine_token_bytes = host_use_fp8_combine ? hidden : (hidden * 2);
+    const int combine_sf_bytes_per_token = host_use_fp8_combine ? (hidden / kCombineGranK) : 0;
+
     // Layouts
     const auto input_token_layout = layout::Data(input_token_bytes);
-    const auto bf16_token_layout = layout::Data(hidden * 2);
+    const auto combine_token_layout = layout::Data(combine_token_bytes);
+    // SF layout: bytes/token may not be a multiple of 16 (e.g. hidden=7168 ->
+    // 7168/128=56 bytes), so disable TMA alignment requirement (the writes
+    // are 1-byte stores via `sym_buffer.map`, not TMA).
+    const auto combine_sf_layout = layout::Data(combine_sf_bytes_per_token, false);
     const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
     const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
     const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
@@ -119,13 +133,36 @@ get_symm_buffer_size_for_mega_moe(
         }
     }
 
-    // All buffers
-    const auto mega_buffer = layout::MegaMoEBuffer(
-        nullptr, hidden, intermediate_hidden,
-        num_ranks, num_experts, num_max_tokens_per_rank,
-        num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts
-    );
+    // L1 input buffer
+    const auto l1_token_buffer = layout::Buffer(
+        input_token_layout, 1, num_ring_tokens,
+        input_topk_weights_buffer.get_end_ptr());
+    const auto l1_sf_buffer = layout::Buffer(
+        input_sf_layout, 1, num_sf_ring_tokens,
+        l1_token_buffer.get_end_ptr());
+    const auto l1_topk_weights_buffer = layout::Buffer(
+        l1_topk_weights_layout, 1, num_ring_tokens,
+        with_sf ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+
+    // L2 input buffer
+    const auto l2_token_buffer = layout::Buffer(
+        intermediate_token_layout, 1, num_ring_tokens,
+        l1_topk_weights_buffer.get_end_ptr());
+    const auto l2_sf_buffer = layout::Buffer(
+        intermediate_sf_layout, 1, num_sf_ring_tokens,
+        l2_token_buffer.get_end_ptr());
+
+    // Combine input buffer: BF16 tokens (default) OR FP8 (when host_use_fp8_combine)
+    // for cross-rank combine.
+    const auto combine_token_buffer = layout::Buffer(
+        combine_token_layout, num_topk, num_max_tokens_per_rank,
+        with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+    // Combine SF buffer: only sized when host_use_fp8_combine (otherwise zero).
+    // Layout matches combine_token_buffer's [num_topk][num_max_tokens_per_rank]
+    // outer shape, with kHidden/128 SF bytes per token.
+    const auto combine_sf_buffer = layout::Buffer(
+        combine_sf_layout, num_topk, num_max_tokens_per_rank,
+        combine_token_buffer.get_end_ptr());
 
     // Check SF buffer requirements
     if (with_sf) {
@@ -198,7 +235,7 @@ get_symm_buffer_size_for_mega_moe(
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {mega_buffer.get_num_bytes(), slice_input_buffers};
+    return {reinterpret_cast<int64_t>(combine_sf_buffer.get_end_ptr()), slice_input_buffers};
 }
 
 static void fp8_fp4_mega_moe(
@@ -315,6 +352,13 @@ static void fp8_fp4_mega_moe(
     // `DG_USE_FP4_ACTS=1` (kind::mxf4 is FP4-only). See A6 capstone /
     // B2 standalone GEMM for the +20-22% headline.
     const bool use_mxf4_kind = use_fp4_acts and get_env<int>("DG_USE_MXF4_KIND") != 0;
+    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the L2 epilogue
+    // ships FP8 E4M3 + per-(token, N=128) UE8M0 SF over NVLink instead of
+    // BF16. The combine reduce dequantizes on the fly. NVLink bytes/token
+    // halve (from kHidden*2 → kHidden + kHidden/128). Independent of the
+    // FP4-acts / MXF4-kind flags above (those control the dispatch a2a +
+    // mainloops; this controls the combine a2a only).
+    const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -335,7 +379,7 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, fast_math,
-                               use_fp4_acts, use_mxf4_kind);
+                               use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
