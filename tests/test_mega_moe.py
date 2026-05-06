@@ -142,15 +142,17 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             shared_l1_weights = shared_l2_weights = None
 
         if not is_bf16xbf16:
-            # FP8 path: cast inputs to FP8/FP4 with per-32 UE8M0 SF
-            assert hidden % 128 == 0 and intermediate_hidden % 128 == 0 and shared_intermediate_hidden % 128 == 0
-            block_m = deep_gemm.get_block_m_for_mega_moe(
-                num_ranks, num_experts, buffer.num_max_tokens_per_rank, num_tokens, num_topk, args.mma_type)
-            x_fp8, x_sf, x_sf_tma = _cast_fp8_for_mega_moe(x)
-            x = (x_fp8, x_sf)
-            shared_x = (x_fp8, x_sf_tma)
-            if num_shared_experts > 0:
-                shared_l1_x_sf = _to_shared_mega_moe_sf_layout(x_sf, block_m, buffer.shared_l1_acts_sf.shape[0])
+            # Cast inputs to FP8/FP4 with per-32 UE8M0 SF
+            assert hidden % 128 == 0 and intermediate_hidden % 128 == 0
+
+            # Stream A0.0b: when the flag is on, the symm buffer's `x` slot is sized
+            # for packed E2M1 (`hidden/2` bytes/token), so we must quantize at the
+            # source to match.
+            if os.environ.get('DG_USE_FP4_ACTS', '0') != '0':
+                x = per_token_cast_to_fp4(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+            else:
+                x = per_token_cast_to_fp8(x, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+
             l1_weights = _cast_weights_to_fp4(l1_weights)
             l2_weights = _cast_weights_to_fp4(l2_weights)
             if num_shared_experts > 0:
