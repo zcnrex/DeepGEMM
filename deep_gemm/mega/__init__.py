@@ -14,6 +14,8 @@ except Exception as exception:
 
 from .. import _C
 
+_MAX_CANDIDATE_BLOCK_M = 192
+
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
@@ -77,6 +79,32 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  activation: str = 'swiglu') -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
+
+    # To save buffer size, we enable ring buffer
+    # TODO: move the wave concept into kernel and dynamically schedule
+    # TODO: currently decoding may consume more memory than prefill
+    # TODO: finer-grained wave
+    num_min_ring_tokens, num_max_ring_tokens = \
+        _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
+    if num_max_tokens_per_rank >= 6144:
+        # We assume must be prefill (decode cannot have such size)
+        # Use the full-pool capacity so prefill keeps the tuned non-wrapping
+        # access pattern from the original MegaMoE implementation.
+        num_experts_per_rank = num_experts // group.size()
+        num_max_recv_tokens = group.size() * num_max_tokens_per_rank
+        num_max_experts_per_token = min(num_topk, num_experts_per_rank)
+        num_ring_tokens = align(
+            num_max_recv_tokens * num_max_experts_per_token +
+            num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
+            _C.get_token_alignment_for_mega_moe())
+    else:
+        # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
+        # the wave heuristics can select the best number of experts per wave
+        # In this case, the budget is roughly ~18 GB
+        num_ring_tokens = _C.get_ring_limit_for_mega_moe(
+            align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
+    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
+    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
 
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
