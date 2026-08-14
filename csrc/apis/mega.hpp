@@ -44,8 +44,11 @@ get_symm_buffer_size_for_mega_moe(
     const std::string& mma_type, const std::string& activation,
     const int& num_shared_experts = 0) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
-    DG_HOST_ASSERT(num_shared_experts >= 0);
+
+    // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
+    const auto mma_kind = parse_mma_kind(mma_type);
+    DG_HOST_ASSERT(activation == "swiglu" or
+                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
@@ -68,7 +71,7 @@ get_symm_buffer_size_for_mega_moe(
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
 
     // Parse MMA type
-    const auto mma_kind = parse_mma_kind(mma_type);
+    const auto num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
     const auto with_sf = is_mma_with_sf(mma_kind);
 
     // Workspace
@@ -261,8 +264,9 @@ static void fp8_fp4_mega_moe(
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
     DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu");
-    DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
+    const bool use_situ = activation == "situ";
 
     // Activation checks
     const auto activation_clamp =
@@ -378,7 +382,7 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math,
+                               activation_clamp, use_situ, fast_math,
                                use_fp4_acts, use_mxf4_kind, use_fp8_combine);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
