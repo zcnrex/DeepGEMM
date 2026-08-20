@@ -14,8 +14,6 @@ except Exception as exception:
 
 from .. import _C
 
-_MAX_CANDIDATE_BLOCK_M = 192
-
 
 class SymmBuffer:
     def __init__(self, group: dist.ProcessGroup,
@@ -25,13 +23,16 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu'):
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.num_shared_experts = num_shared_experts
+        self.mma_type = mma_type
+        self.activation = activation
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -80,32 +81,6 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
-    # To save buffer size, we enable ring buffer
-    # TODO: move the wave concept into kernel and dynamically schedule
-    # TODO: currently decoding may consume more memory than prefill
-    # TODO: finer-grained wave
-    num_min_ring_tokens, num_max_ring_tokens = \
-        _C.get_ring_limit_for_mega_moe(num_max_tokens_per_rank, num_experts // group.size(), num_topk, group.size())
-    if num_max_tokens_per_rank >= 6144:
-        # We assume must be prefill (decode cannot have such size)
-        # Use the full-pool capacity so prefill keeps the tuned non-wrapping
-        # access pattern from the original MegaMoE implementation.
-        num_experts_per_rank = num_experts // group.size()
-        num_max_recv_tokens = group.size() * num_max_tokens_per_rank
-        num_max_experts_per_token = min(num_topk, num_experts_per_rank)
-        num_ring_tokens = align(
-            num_max_recv_tokens * num_max_experts_per_token +
-            num_experts_per_rank * (_MAX_CANDIDATE_BLOCK_M - 1),
-            _C.get_token_alignment_for_mega_moe())
-    else:
-        # Otherwise, we must ensure, like for EP64, 4K decoding batch size,
-        # the wave heuristics can select the best number of experts per wave
-        # In this case, the budget is roughly ~18 GB
-        num_ring_tokens = _C.get_ring_limit_for_mega_moe(
-            align(4096, _C.get_token_alignment_for_mega_moe()), 432 // 72, 6, 72)[1]
-    num_ring_tokens = max(num_ring_tokens, num_min_ring_tokens)
-    num_ring_tokens = min(num_ring_tokens, num_max_ring_tokens)
-
     # Backward compat: derive `mma_type` from `use_fp8_dispatch` if provided
     if use_fp8_dispatch is not None:
         assert use_fp8_dispatch == (mma_type.split('x')[0] == 'fp8')
@@ -140,6 +115,22 @@ def _interleave_weights(t: torch.Tensor, gran: int = 8) -> torch.Tensor:
     return result.squeeze(0) if squeeze_group_dim else result
 
 
+def _interleave_weights_packed_fp4(t: torch.Tensor) -> torch.Tensor:
+    assert t.dim() in (2, 3)
+    squeeze_group_dim = t.dim() == 2
+    if squeeze_group_dim:
+        t = t.unsqueeze(0)
+
+    g, n, *rest = t.shape
+    half = n // 2
+    assert half % 16 == 0
+    gate = t[:, :half].reshape(g, half // 16, 16, *rest)
+    up = t[:, half:].reshape(g, half // 16, 16, *rest)
+    result = torch.cat([gate[:, :, 0::2], up[:, :, 0::2], gate[:, :, 1::2], up[:, :, 1::2]], dim=2)
+    result = torch.empty_like(t).copy_(result.reshape(g, n, *rest))
+    return result.squeeze(0) if squeeze_group_dim else result
+
+
 def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
     # Unsqueeze for 2D
     assert sf.dtype == torch.int and sf.dim() in (2, 3)
@@ -160,14 +151,17 @@ def _transpose_sf_for_utccp(sf: torch.Tensor) -> torch.Tensor:
 def transform_weights_for_mega_moe(
     l1_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     l2_weights: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
-    activation: str = 'swiglu'
+    activation: str = 'swiglu',
+    mma_type: str = 'fp8xfp4'
 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
            Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]:
-    assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+    assert activation in ('swiglu', 'swigluoai', 'situ'), f'Unsupported activation `{activation}`'
     if isinstance(l1_weights, tuple):
-        # FP8: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP
-        l1_w = _interleave_weights(l1_weights[0])
-        l1_sf = _transpose_sf_for_utccp(_interleave_weights(l1_weights[1]))
+        # FP8/MXFP4/NVFP4: interleave gate/up for weight and SF, then transpose L1 SF for UTCCP.
+        interleave = _interleave_weights_packed_fp4 if mma_type in ('mxf4xmxf4', 'nvfp4xnvfp4') \
+            else _interleave_weights
+        l1_w = interleave(l1_weights[0])
+        l1_sf = _transpose_sf_for_utccp(interleave(l1_weights[1]))
         l1_transformed = (l1_w, l1_sf)
         # L2: only transpose SF for UTCCP
         l2_transformed = (l2_weights[0], _transpose_sf_for_utccp(l2_weights[1]))
@@ -192,19 +186,44 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      fast_math: bool = True):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
+    (shared_l1_data, shared_l1_sf) = shared_l1_weights if shared_l1_weights is not None else (None, None)
+    (shared_l2_data, shared_l2_sf) = shared_l2_weights if shared_l2_weights is not None else (None, None)
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights_data, l1_weights_sf,
         l2_weights_data, l2_weights_sf,
+        shared_l1_data, shared_l1_sf,
+        shared_l2_data, shared_l2_sf,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
         sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
+        recipe, sym_buffer.mma_type,
         activation, activation_clamp,
         fast_math
     )
+
+def nvfp4_mega_moe(y: torch.Tensor,
+                   l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                   l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                   sym_buffer: SymmBuffer,
+                   shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                   shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                   cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                   activation: str = 'swiglu',
+                   activation_clamp: Optional[float] = None,
+                   fast_math: bool = True):
+    # NOTES: NVFP4 is the same entry point with a per-16 SF granularity
+    fp8_fp4_mega_moe(
+        y, l1_weights, l2_weights, sym_buffer,
+        shared_l1_weights, shared_l2_weights,
+        cumulative_local_expert_recv_stats,
+        recipe=(1, 1, 16),
+        activation=activation, activation_clamp=activation_clamp,
+        fast_math=fast_math
+    )
+
 
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,

@@ -2,7 +2,7 @@
 
 #include <functional>
 #include <string>
-// #include <pybind11/functional.h>
+#include <torch/torch.h>
 
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
@@ -14,8 +14,6 @@
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_mega_moe_pre_dispatch.hpp"
-#include "../utils/math.hpp"
-#include "../utils/system.hpp"
 
 namespace deep_gemm::mega {
 
@@ -47,8 +45,9 @@ get_symm_buffer_size_for_mega_moe(
 
     // SiTU is implemented only by the SM100 FP8xFP4 MegaMoE kernel.
     const auto mma_kind = parse_mma_kind(mma_type);
-    DG_HOST_ASSERT(activation == "swiglu" or
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
                    (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
+    DG_HOST_ASSERT(num_shared_experts >= 0);
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
@@ -71,62 +70,9 @@ get_symm_buffer_size_for_mega_moe(
     num_ring_tokens = math::align(num_ring_tokens, layout::kLCMCandidateBlockM);
 
     // Parse MMA type
-    const auto num_mma_elem_bytes = get_num_mma_elem_bytes(mma_kind);
     const auto with_sf = is_mma_with_sf(mma_kind);
 
-    // Workspace
-    const auto workspace = layout::Workspace(
-        nullptr, num_ranks, num_experts, num_max_tokens_per_rank, num_topk, num_ring_tokens);
-
-    // Stream A0.0b: when `DG_USE_FP4_ACTS=1`, the symmetric `x` slot and the
-    // L1 token pool both hold packed E2M1 (FP4) instead of dense E4M3 (FP8).
-    // The per-token byte footprint halves; the SF slot is unchanged
-    // (`hidden/32` UE8M0 bytes — same `gran_k=32` for FP4 and FP8 acts under
-    // `kind::mxf8f6f4`). The host-side flag is read from the env so the
-    // existing `use_fp8_dispatch` API surface (which is hardcoded `true`
-    // throughout) doesn't need to change to opt in.
-    const bool host_use_fp4_acts = with_sf and get_env<int>("DG_USE_FP4_ACTS") != 0;
-    const int input_token_bytes = host_use_fp4_acts ? (hidden / 2) : hidden * num_mma_elem_bytes;
-
-    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the combine slot
-    // holds FP8 E4M3 (kHidden bytes/token) + a separate combine_sf slot
-    // holding UE8M0 SF bytes (kHidden/128 bytes/token, gran_k=128). When off,
-    // the combine slot holds BF16 (kHidden*2 bytes/token) and combine_sf is
-    // unused (zero-sized).
-    const bool host_use_fp8_combine = with_sf and get_env<int>("DG_USE_FP8_COMBINE") != 0;
-    constexpr int kCombineGranK = 128;
-    const int combine_token_bytes = host_use_fp8_combine ? hidden : (hidden * 2);
-    const int combine_sf_bytes_per_token = host_use_fp8_combine ? (hidden / kCombineGranK) : 0;
-
-    // Layouts
-    const auto input_token_layout = layout::Data(input_token_bytes);
-    const auto combine_token_layout = layout::Data(combine_token_bytes);
-    // SF layout: bytes/token may not be a multiple of 16 (e.g. hidden=7168 ->
-    // 7168/128=56 bytes), so disable TMA alignment requirement (the writes
-    // are 1-byte stores via `sym_buffer.map`, not TMA).
-    const auto combine_sf_layout = layout::Data(combine_sf_bytes_per_token, false);
-    const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
-    const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
-    const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
-    const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
-    const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
-    const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
-
-    // Input buffers
-    const auto input_token_buffer = layout::Buffer(
-        input_token_layout, 1, num_max_tokens_per_rank,
-        workspace.get_end_ptr());
-    const auto input_sf_buffer = layout::Buffer(
-        input_sf_layout, 1, num_max_tokens_per_rank,
-        input_token_buffer.get_end_ptr());
-    const auto input_topk_idx_buffer = layout::Buffer(
-        input_topk_idx_layout, 1, num_max_tokens_per_rank,
-        with_sf ? input_sf_buffer.get_end_ptr() : input_token_buffer.get_end_ptr());
-    const auto input_topk_weights_buffer = layout::Buffer(
-        input_topk_weights_layout, 1, num_max_tokens_per_rank,
-        input_topk_idx_buffer.get_end_ptr());
-
-    // Padded SF pool tokens
+    // Compute num_sf_ring_tokens (max across all candidate block sizes)
     int num_sf_ring_tokens = 0;
     if (with_sf) {
         for (auto block_m: layout::kCandidateBlockM) {
@@ -136,36 +82,24 @@ get_symm_buffer_size_for_mega_moe(
         }
     }
 
-    // L1 input buffer
-    const auto l1_token_buffer = layout::Buffer(
-        input_token_layout, 1, num_ring_tokens,
-        input_topk_weights_buffer.get_end_ptr());
-    const auto l1_sf_buffer = layout::Buffer(
-        input_sf_layout, 1, num_sf_ring_tokens,
-        l1_token_buffer.get_end_ptr());
-    const auto l1_topk_weights_buffer = layout::Buffer(
-        l1_topk_weights_layout, 1, num_ring_tokens,
-        with_sf ? l1_sf_buffer.get_end_ptr() : l1_token_buffer.get_end_ptr());
+    // All buffers
+    const auto mega_buffer = layout::MegaMoEBuffer(
+        nullptr, hidden, intermediate_hidden,
+        num_ranks, num_experts, num_max_tokens_per_rank,
+        num_topk, num_ring_tokens, num_sf_ring_tokens, mma_kind,
+        num_shared_experts
+    );
 
-    // L2 input buffer
-    const auto l2_token_buffer = layout::Buffer(
-        intermediate_token_layout, 1, num_ring_tokens,
-        l1_topk_weights_buffer.get_end_ptr());
-    const auto l2_sf_buffer = layout::Buffer(
-        intermediate_sf_layout, 1, num_sf_ring_tokens,
-        l2_token_buffer.get_end_ptr());
-
-    // Combine input buffer: BF16 tokens (default) OR FP8 (when host_use_fp8_combine)
-    // for cross-rank combine.
-    const auto combine_token_buffer = layout::Buffer(
-        combine_token_layout, num_topk, num_max_tokens_per_rank,
-        with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
-    // Combine SF buffer: only sized when host_use_fp8_combine (otherwise zero).
-    // Layout matches combine_token_buffer's [num_topk][num_max_tokens_per_rank]
-    // outer shape, with kHidden/128 SF bytes per token.
-    const auto combine_sf_buffer = layout::Buffer(
-        combine_sf_layout, num_topk, num_max_tokens_per_rank,
-        combine_token_buffer.get_end_ptr());
+    // Activation layout: FP8 for MXFP8FP4, raw bytes holding 2 packed FP4 values for NVFP4/MXFP4
+    const auto acts_dtype = with_sf ?
+        (get_element_bits(mma_kind) == 4 ? torch::kUInt8 : torch::kFloat8_e4m3fn) : torch::kBFloat16;
+    const int acts_storage_bits = static_cast<int>(c10::elementSize(acts_dtype)) * 8;
+    const auto num_acts_cols = [=](const int& num_elems) {
+        return num_elems * get_element_bits(mma_kind) / acts_storage_bits;
+    };
+    const auto num_sf_cols = [=](const int& num_elems) {
+        return num_elems / (get_sf_gran_k(mma_kind) * 4);
+    };
 
     // Check SF buffer requirements
     if (with_sf) {
@@ -176,20 +110,14 @@ get_symm_buffer_size_for_mega_moe(
 
     // Slice function: creates tensor views from the raw buffer.
     // NOTES: `x_sf` is K-major, while `l1_acts_sf` and `l2_acts_sf` are M-major
-    // Stream A0.0b: under `host_use_fp4_acts`, the `x` and `l1_acts` views
-    // expose packed E2M1 (`kPackedFP4` = `torch::kInt8`, 2 elements/byte) of
-    // shape `[..., hidden / 2]`. Underlying buffer bytes are the same as the
-    // sized `fp8_token_layout` slot, just half the row width.
-    const auto x_dtype = with_sf ? (host_use_fp4_acts ? kPackedFP4 : torch::kFloat8_e4m3fn) : torch::kBFloat16;
-    const int x_inner_cols = host_use_fp4_acts ? (hidden / 2) : hidden;
     auto slice_input_buffers = [=](const torch::Tensor& buffer) {
         auto x = torch::from_blob(
-            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(input_token_buffer.base)),
-            {num_max_tokens_per_rank, x_inner_cols},
-            torch::TensorOptions().dtype(x_dtype).device(buffer.device()));
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_token_buffer.base)),
+            {num_max_tokens_per_rank, num_acts_cols(hidden)},
+            torch::TensorOptions().dtype(acts_dtype).device(buffer.device()));
         auto x_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_sf_buffer.base)),
-            {num_max_tokens_per_rank, hidden / 128},
+            {num_max_tokens_per_rank, num_sf_cols(hidden)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto topk_idx = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_topk_idx_buffer.base)),
@@ -203,42 +131,42 @@ get_symm_buffer_size_for_mega_moe(
         auto shared_l1_acts = x;
         auto shared_l1_acts_sf = (with_sf and num_shared_experts > 0) ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l1_sf_buffer.base)),
-            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), hidden / 128},
+            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), num_sf_cols(hidden)},
             {1, layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts = num_shared_experts > 0 ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_token_buffer.base)),
-            {num_max_tokens_per_rank, shared_intermediate_hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device())) : torch::Tensor();
+            {num_max_tokens_per_rank, num_acts_cols(shared_intermediate_hidden)},
+            torch::TensorOptions().dtype(acts_dtype).device(buffer.device())) : torch::Tensor();
         auto shared_l2_acts_sf = (with_sf and num_shared_experts > 0) ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.shared_l2_sf_buffer.base)),
-            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), shared_intermediate_hidden / 128},
+            {layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank), num_sf_cols(shared_intermediate_hidden)},
             {1, layout::get_num_max_shared_sf_tokens(num_max_tokens_per_rank)},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
 
         auto l1_acts = torch::from_blob(
-            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(l1_token_buffer.base)),
-            {num_ring_tokens, x_inner_cols},
-            torch::TensorOptions().dtype(x_dtype).device(buffer.device()));
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_token_buffer.base)),
+            {num_ring_tokens, num_acts_cols(hidden)},
+            torch::TensorOptions().dtype(acts_dtype).device(buffer.device()));
         auto l1_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l1_sf_buffer.base)),
-            {num_sf_ring_tokens, hidden / 128},
+            {num_sf_ring_tokens, num_sf_cols(hidden)},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         auto l2_acts = torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_token_buffer.base)),
-            {num_ring_tokens, intermediate_hidden},
-            torch::TensorOptions().dtype(with_sf ? torch::kFloat8_e4m3fn : torch::kBFloat16).device(buffer.device()));
+            {num_ring_tokens, num_acts_cols(intermediate_hidden)},
+            torch::TensorOptions().dtype(acts_dtype).device(buffer.device()));
         auto l2_acts_sf = with_sf ? torch::from_blob(
             math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.l2_sf_buffer.base)),
-            {num_sf_ring_tokens, intermediate_hidden / 128},
+            {num_sf_ring_tokens, num_sf_cols(intermediate_hidden)},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
     };
-    return {reinterpret_cast<int64_t>(combine_sf_buffer.get_end_ptr()), slice_input_buffers};
+    return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
 
 static void fp8_fp4_mega_moe(
@@ -253,6 +181,7 @@ static void fp8_fp4_mega_moe(
     const int& num_max_tokens_per_rank,
     const int& num_experts, const int& num_topk,
     const std::tuple<int, int, int>& recipe,
+    const std::string& mma_type,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
@@ -263,10 +192,24 @@ static void fp8_fp4_mega_moe(
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     const auto [rm, rn, rk] = recipe;
-    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
-    DG_HOST_ASSERT(activation == "swiglu" or activation == "situ");
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and (rk == 32 or rk == 16));
+    // The MMA kind comes from the symmetric buffer's `mma_type`: its activation slots were
+    // sized for that kind, so anything else here would disagree with the buffer's layout.
+    const auto mma_kind = parse_mma_kind(mma_type);
+    if (mma_kind != MmaKind::MXFP8FP4 and mma_kind != MmaKind::MXFP4 and mma_kind != MmaKind::NVFP4)
+        DG_HOST_UNREACHABLE("`" + mma_type + "` activations are not implemented by the SM100 "
+                            "mega-MoE kernel (only `fp8xfp4`, `mxf4xmxf4` and `nvfp4xnvfp4` are); "
+                            "allocate the symmetric buffer with one of those");
+    if (rk != get_sf_gran_k(mma_kind))
+        DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(rk) + " does not match `" +
+                            mma_type + "` (expected " +
+                            std::to_string(get_sf_gran_k(mma_kind)) + ")");
+    DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
+                   (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
     const bool use_situ = activation == "situ";
+    const float swiglu_alpha = activation == "swigluoai" ? 1.702f : 0.0f;
+    DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
 
     // Activation checks
     const auto activation_clamp =
@@ -289,8 +232,9 @@ static void fp8_fp4_mega_moe(
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
-    // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
-    constexpr int kGranMN = 1, kGranK = 32;
+    // Check weight SF layout for byte-packing, MN-major, and TMA alignment
+    constexpr int kGranMN = 1;
+    const int kGranK = rk;
     check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
                     num_experts_per_rank, true, false, torch::kInt);
     check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
@@ -301,16 +245,19 @@ static void fp8_fp4_mega_moe(
     if (shared_l1_weights_tuple_opt.has_value()) {
         std::tie(shared_l1_weights, shared_l1_weights_sf) = shared_l1_weights_tuple_opt.value();
         std::tie(shared_l2_weights, shared_l2_weights_sf) = shared_l2_weights_tuple_opt.value();
-        shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1));
+        const bool is_packed_fp4 = mma_kind == MmaKind::MXFP4 or mma_kind == MmaKind::NVFP4;
+        shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1)) *
+                                     (is_packed_fp4 ? 2 : 1);
         num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
 
         DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
         DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l2_weights.dim() == 2);
         DG_HOST_ASSERT(shared_l1_weights.size(0) == shared_intermediate_hidden * 2);
-        DG_HOST_ASSERT(shared_l1_weights.size(1) == hidden);
+        DG_HOST_ASSERT(shared_l1_weights.size(1) == (is_packed_fp4 ? hidden / 2 : hidden));
         DG_HOST_ASSERT(shared_l2_weights.size(0) == hidden);
-        DG_HOST_ASSERT(shared_l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
-        DG_HOST_ASSERT(shared_l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        const auto shared_weight_dtype = is_packed_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn;
+        DG_HOST_ASSERT(shared_l1_weights.scalar_type() == shared_weight_dtype);
+        DG_HOST_ASSERT(shared_l2_weights.scalar_type() == shared_weight_dtype);
         DG_HOST_ASSERT(shared_l1_weights.is_contiguous() and shared_l2_weights.is_contiguous());
         DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
         DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
@@ -334,35 +281,19 @@ static void fp8_fp4_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xfp4", activation, num_shared_experts
+        mma_type, activation, num_shared_experts
     );
-    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+    if (sym_buffer.nbytes() < static_cast<size_t>(num_required_bytes))
+        DG_HOST_UNREACHABLE("symmetric buffer is " + std::to_string(sym_buffer.nbytes()) +
+                            " bytes but `" + mma_type + "`/`" + activation + "` with " +
+                            std::to_string(num_shared_experts) + " shared expert(s) needs " +
+                            std::to_string(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
                 l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
-
-    // Stream A0.1: pick up FP4-acts flag from `DG_USE_FP4_ACTS` env var.
-    // Default off — preserves byte-identical FP8-acts behavior. Setting
-    // `DG_USE_FP4_ACTS=1` flips L1's epilogue quant to E2M1 + UE8M0 SF.
-    const bool use_fp4_acts = get_env<int>("DG_USE_FP4_ACTS") != 0;
-    // Stream A0.5: when also `DG_USE_MXF4_KIND=1`, the L1 and L2 mainloops
-    // run `tcgen05.mma.kind::mxf4.block_scale.block32` instead of
-    // `kind::mxf8f6f4` — K=64 dense per call (vs K=32 with-padding), dense
-    // FP4 smem (`_ALIGN8B`, half the byte footprint), scale_vec::2X SF
-    // protocol with HALF-WORD address bits. Only honored when
-    // `DG_USE_FP4_ACTS=1` (kind::mxf4 is FP4-only). See A6 capstone /
-    // B2 standalone GEMM for the +20-22% headline.
-    const bool use_mxf4_kind = use_fp4_acts and get_env<int>("DG_USE_MXF4_KIND") != 0;
-    // Stream B (combine path): when `DG_USE_FP8_COMBINE=1`, the L2 epilogue
-    // ships FP8 E4M3 + per-(token, N=128) UE8M0 SF over NVLink instead of
-    // BF16. The combine reduce dequantizes on the fly. NVLink bytes/token
-    // halve (from kHidden*2 → kHidden + kHidden/128). Independent of the
-    // FP4-acts / MXF4-kind flags above (those control the dispatch a2a +
-    // mainloops; this controls the combine a2a only).
-    const bool use_fp8_combine = get_env<int>("DG_USE_FP8_COMBINE") != 0;
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -382,8 +313,8 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, use_situ, fast_math,
-                               use_fp4_acts, use_mxf4_kind, use_fp8_combine);
+                               activation_clamp, swiglu_alpha, use_situ, fast_math,
+                               mma_kind);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -510,20 +441,8 @@ static void register_apis(pybind11::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
-    m.def("mega_moe_pre_dispatch", &mega_moe_pre_dispatch,
-          pybind11::arg("x"),
-          pybind11::arg("topk_idx"),
-          pybind11::arg("topk_weights"),
-          pybind11::arg("buf_x"),
-          pybind11::arg("buf_x_sf"),
-          pybind11::arg("buf_topk_idx"),
-          pybind11::arg("buf_topk_weights"),
-          pybind11::arg("num_tokens"),
-          pybind11::arg("group_size") = 32,
-          pybind11::arg("use_fp4_acts") = false);
 #endif
 }
-
 #endif
 
 } // namespace deep_gemm::mega

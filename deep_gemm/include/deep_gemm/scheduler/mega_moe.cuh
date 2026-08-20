@@ -147,9 +147,8 @@ template <uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
           uint32_t kNumExpertsPerLane = math::constexpr_ceil_div(kNumExpertsPerRank, 32u),
           uint32_t kNumL1BlockNs = L1_SHAPE_N / BLOCK_N,
           uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N,
-          uint32_t kNumL1BlockKs = L1_SHAPE_K / BLOCK_K,
-          uint32_t kNumL2BlockKs = L2_SHAPE_K / BLOCK_K,
-          typename WorkspaceT = layout::Workspace>
+          uint32_t kNumL1Clusters = kNumL1BlockNs / 2,
+          uint32_t kNumL2Clusters = kNumL2BlockNs / 2>
 struct MegaMoEScheduler {
     static constexpr bool kHasShared = kNumSharedExperts > 0;
     static constexpr uint32_t SHARED_L1_SHAPE_N = L1_SHAPE_N * kNumSharedExperts;
@@ -172,8 +171,8 @@ struct MegaMoEScheduler {
     DG_STATIC_ASSERT(kNumSMs % 2 == 0, "Number of SMs must be even for 2-CTA cluster");
     DG_STATIC_ASSERT(kNumRingBlocks > 0, "Invalid ring buffer config");
 
-    // Arrival counts
-    const WorkspaceT& workspace;
+    // Workspace
+    const layout::Workspace& workspace;
 
     // Scheduler configs
     static constexpr uint32_t kNumScheduleStages = 2;
@@ -189,8 +188,26 @@ struct MegaMoEScheduler {
     uint32_t stored_num_tokens_per_expert[kNumExpertsPerLane] = {};
     uint32_t num_total_m_blocks = 0;
 
-    CUTLASS_DEVICE explicit MegaMoEScheduler(const WorkspaceT& workspace): workspace(workspace) {
-        block_idx = blockIdx.x;
+    // Per-scheduler warmup waves; all CTA-pair schedulers together form one global wave.
+    static constexpr uint32_t kNumSchedL1WavesDone = 0xffffffffu;
+    uint32_t num_sched_l1_waves = 0;
+
+    CUTLASS_DEVICE explicit MegaMoEScheduler(const layout::Workspace& workspace):
+        workspace(workspace) {}
+
+    CUTLASS_DEVICE MegaMoEScheduler(const layout::Workspace& workspace,
+                                    Barrier* task_info_full_barriers,
+                                    Barrier* task_info_empty_barriers,
+                                    task_info_t* task_infos):
+        workspace(workspace),
+        task_info_full_barriers(task_info_full_barriers),
+        task_info_empty_barriers(task_info_empty_barriers),
+        task_infos(task_infos) {}
+
+    CUTLASS_DEVICE void advance_sched_pipeline() {
+        DG_STATIC_ASSERT(kNumScheduleStages == 2, "Invalid stages");
+        sched_stage_idx ^= 1;
+        sched_phase ^= sched_stage_idx == 0;
     }
 
     CUTLASS_DEVICE bool get_next_task(task_info_t& task_info) {

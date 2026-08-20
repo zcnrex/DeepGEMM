@@ -639,22 +639,25 @@ int64_t dg_get_token_alignment_for_mega_moe() {
     return (int64_t)mega::get_token_alignment_for_mega_moe();
 }
 
-Tuple<int64_t, int64_t> dg_get_ring_limit_for_mega_moe(int64_t num_max_tokens_per_rank,
-                                                       int64_t num_experts_per_rank,
-                                                       int64_t num_topk,
-                                                       int64_t num_ranks) {
-    const auto [min_ring, max_ring] = mega::get_ring_limit_for_mega_moe(
+int64_t dg_get_block_m_for_mega_moe(int64_t num_ranks, int64_t num_experts,
+                                    int64_t num_max_tokens_per_rank, int64_t num_tokens,
+                                    int64_t num_topk, std::string mma_type) {
+    return static_cast<int64_t>(mega::get_block_m_for_mega_moe(
+        static_cast<int>(num_ranks),
+        static_cast<int>(num_experts),
         static_cast<int>(num_max_tokens_per_rank),
-        static_cast<int>(num_experts_per_rank),
+        static_cast<int>(num_tokens),
         static_cast<int>(num_topk),
-        static_cast<int>(num_ranks));
-    return Tuple<int64_t, int64_t>(static_cast<int64_t>(min_ring), static_cast<int64_t>(max_ring));
+        mma_type));
 }
 
-Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>
+using MegaSliceResult = Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+                              Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
+
+Tuple<int64_t, TypedFunction<MegaSliceResult(TensorView)>>
 dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int64_t num_max_tokens_per_rank, int64_t num_topk, int64_t hidden,
                                     int64_t intermediate_hidden, std::string mma_type, std::string activation,
-                                    int64_t num_ring_tokens) {
+                                    int64_t num_shared_experts) {
     auto [num_bytes, fn] = mega::get_symm_buffer_size_for_mega_moe(
         static_cast<int>(num_ranks),
         static_cast<int>(num_experts),
@@ -664,23 +667,35 @@ dg_get_symm_buffer_size_for_mega_moe(int64_t num_ranks, int64_t num_experts, int
         static_cast<int>(intermediate_hidden),
         mma_type,
         activation,
-        static_cast<int>(num_ring_tokens)
+        static_cast<int>(num_shared_experts)
     );
 
     auto slice_input_buffers = [=](TensorView buffer) {
-        auto [x, x_sf, topk_idx, topk_weights, l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] =  fn(convert_to_torch_tensor(buffer));
-        return Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(
-            Tensor::FromDLPack(at::toDLPack(x.view(at::kChar))),
-            Tensor::FromDLPack(at::toDLPack(x_sf)),
-            Tensor::FromDLPack(at::toDLPack(topk_idx)),
-            Tensor::FromDLPack(at::toDLPack(topk_weights)),
-            Tensor::FromDLPack(at::toDLPack(l1_acts.view(at::kChar))),
-            Tensor::FromDLPack(at::toDLPack(l1_acts_sf)),
-            Tensor::FromDLPack(at::toDLPack(l2_acts.view(at::kChar))),
-            Tensor::FromDLPack(at::toDLPack(l2_acts_sf))
+        const auto buffer_torch = convert_to_torch_tensor(buffer);
+        auto [x, x_sf, topk_idx, topk_weights,
+              shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+              l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = fn(buffer_torch);
+        // DLPack cannot carry FP8/FP4 dtypes, so activation views cross the
+        // bridge as raw bytes; undefined views (BF16 SFs, absent shared
+        // experts) cross as empty byte tensors.
+        const auto as_bytes = [&](const torch::Tensor& t) {
+            const auto t_val = t.defined()
+                ? t
+                : torch::empty({0}, torch::TensorOptions().dtype(torch::kChar).device(buffer_torch.device()));
+            return Tensor::FromDLPack(at::toDLPack(
+                t_val.scalar_type() == torch::kFloat8_e4m3fn or t_val.scalar_type() == torch::kUInt8
+                    ? t_val.view(at::kChar) : t_val));
+        };
+        return MegaSliceResult(
+            as_bytes(x), as_bytes(x_sf),
+            as_bytes(topk_idx), as_bytes(topk_weights),
+            as_bytes(shared_l1_acts), as_bytes(shared_l1_acts_sf),
+            as_bytes(shared_l2_acts), as_bytes(shared_l2_acts_sf),
+            as_bytes(l1_acts), as_bytes(l1_acts_sf),
+            as_bytes(l2_acts), as_bytes(l2_acts_sf)
         );
     };
-    return Tuple<int64_t, TypedFunction<Tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>(TensorView)>>(
+    return Tuple<int64_t, TypedFunction<MegaSliceResult(TensorView)>>(
         num_bytes, slice_input_buffers);
 }
 
@@ -716,10 +731,12 @@ dg_get_symm_buffer_size_for_sm90_mega_moe(int64_t num_ranks, int64_t num_experts
 }
 
 void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weights_sf, TensorView l2_weights, TensorView l2_weights_sf,
+                        Optional<TensorView> shared_l1_weights, Optional<TensorView> shared_l1_weights_sf,
+                        Optional<TensorView> shared_l2_weights, Optional<TensorView> shared_l2_weights_sf,
                         Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                         int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
-                        Tuple<int64_t, int64_t, int64_t> recipe, std::string activation, Optional<double> activation_clamp_opt,
-                        bool fast_math, int64_t num_ring_tokens) {
+                        Tuple<int64_t, int64_t, int64_t> recipe, std::string mma_type, std::string activation, Optional<double> activation_clamp_opt,
+                        bool fast_math) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -731,23 +748,34 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
     auto [recipe_a, recipe_b, recipe_c] = recipe;
     auto recipe_val = std::make_tuple(static_cast<int>(recipe_a), static_cast<int>(recipe_b), static_cast<int>(recipe_c));
 
+    DG_HOST_ASSERT(shared_l1_weights.has_value() == shared_l1_weights_sf.has_value());
+    DG_HOST_ASSERT(shared_l2_weights.has_value() == shared_l2_weights_sf.has_value());
+    auto shared_l1_val = shared_l1_weights.has_value()
+        ? std::optional<std::tuple<torch::Tensor, torch::Tensor>>(std::make_tuple(
+              convert_to_torch_tensor(shared_l1_weights.value()), convert_to_torch_tensor(shared_l1_weights_sf.value())))
+        : std::nullopt;
+    auto shared_l2_val = shared_l2_weights.has_value()
+        ? std::optional<std::tuple<torch::Tensor, torch::Tensor>>(std::make_tuple(
+              convert_to_torch_tensor(shared_l2_weights.value()), convert_to_torch_tensor(shared_l2_weights_sf.value())))
+        : std::nullopt;
+
     mega::fp8_fp4_mega_moe(
         convert_to_torch_tensor(y),
-        std::make_pair(convert_to_torch_tensor(l1_weights), convert_to_torch_tensor(l1_weights_sf)),
-        std::make_pair(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
+        std::make_tuple(convert_to_torch_tensor(l1_weights), convert_to_torch_tensor(l1_weights_sf)),
+        std::make_tuple(convert_to_torch_tensor(l2_weights), convert_to_torch_tensor(l2_weights_sf)),
+        shared_l1_val, shared_l2_val,
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
-        static_cast<int>(num_topk), recipe_val, activation, act_clamp_opt_val, fast_math,
-        static_cast<int>(num_ring_tokens)
+        static_cast<int>(num_topk), recipe_val, mma_type, activation, act_clamp_opt_val, fast_math
     );
 }
 
 void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights,
+                      Optional<TensorView> shared_l1_weights, Optional<TensorView> shared_l2_weights,
                       Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer,
                       Array<int64_t> sym_buffer_ptrs, int64_t rank_idx,
                       int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
-                      std::string activation, Optional<double> activation_clamp_opt, bool fast_math,
-                      int64_t num_ring_tokens) {
+                      std::string activation, Optional<double> activation_clamp_opt, bool fast_math) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -757,14 +785,17 @@ void dg_bf16_mega_moe(TensorView y, TensorView l1_weights, TensorView l2_weights
         sym_buffer_ptrs_val.push_back(*it);
     }
 
+    auto shared_l1_val = shared_l1_weights.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(shared_l1_weights.value())) : std::nullopt;
+    auto shared_l2_val = shared_l2_weights.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(shared_l2_weights.value())) : std::nullopt;
+
     mega::bf16_mega_moe(
         convert_to_torch_tensor(y),
         convert_to_torch_tensor(l1_weights),
         convert_to_torch_tensor(l2_weights),
+        shared_l1_val, shared_l2_val,
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
-        static_cast<int>(num_topk), activation, act_clamp_opt_val, fast_math,
-        static_cast<int>(num_ring_tokens)
+        static_cast<int>(num_topk), activation, act_clamp_opt_val, fast_math
     );
 }
 
@@ -833,7 +864,7 @@ void dg_mega_moe_pre_dispatch_sm90(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_token_alignment_for_mega_moe, dg_get_token_alignment_for_mega_moe);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_ring_limit_for_mega_moe, dg_get_ring_limit_for_mega_moe);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_block_m_for_mega_moe, dg_get_block_m_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_mega_moe, dg_get_symm_buffer_size_for_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(get_symm_buffer_size_for_sm90_mega_moe, dg_get_symm_buffer_size_for_sm90_mega_moe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fp8_fp4_mega_moe, dg_fp8_fp4_mega_moe);

@@ -96,16 +96,11 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
     int seq_len, seq_len_kv, num_heads, head_dim;
 
     const auto arch_major = device_runtime->get_arch_major();
-    if (is_fp4) {
-        // Check FP4 Q
-        std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
-        head_dim *= 2;
-        DG_HOST_ASSERT(arch_major == 10 or arch_major == 12);
-        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
-        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        DG_HOST_ASSERT(arch_major != 12 or head_dim == 128);  // SM120 FP4 MQA logits: head_dim=128 only
-        DG_HOST_ASSERT(q_fp.is_contiguous());
-        DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
+    // Check Q
+    std::tie(seq_len, num_heads, head_dim) = get_logical_shape<3>(q_fp);
+    DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q_fp.is_contiguous());
+    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
 
     // Check SF Q
     if (is_mx_sf) {
@@ -115,42 +110,6 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
         DG_HOST_ASSERT(seq_len == _seq_len and num_heads == _num_heads);
         DG_HOST_ASSERT(q_sf.value().is_contiguous());
         DG_HOST_ASSERT(q_sf.value().scalar_type() == torch::kInt32);
-
-        // Check FP4 KV
-        int _head_dim;
-        std::tie(seq_len_kv, _head_dim) = get_shape<2>(kv_fp);
-        _head_dim *= 2;
-        DG_HOST_ASSERT(head_dim == _head_dim);
-        DG_HOST_ASSERT(kv_fp.is_contiguous());
-        DG_HOST_ASSERT(kv_fp.scalar_type() == kPackedFP4);
-
-        // Check SF KV
-        auto [_seq_len_kv] = get_shape<1>(kv_sf);
-        DG_HOST_ASSERT(seq_len_kv == _seq_len_kv);
-        DG_HOST_ASSERT(kv_sf.is_contiguous());
-        DG_HOST_ASSERT(kv_sf.scalar_type() == torch::kInt32);
-    } else {
-        // Check FP8 Q
-        std::tie(seq_len, num_heads, head_dim) = get_shape<3>(q_fp);
-        DG_HOST_ASSERT((arch_major == 10 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
-                       (arch_major == 12 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
-                       (arch_major == 9 and (num_heads == 32 or num_heads == 64)));
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        DG_HOST_ASSERT(q_fp.is_contiguous());
-        DG_HOST_ASSERT(q_fp.scalar_type() == torch::kFloat8_e4m3fn);
-
-        // Check FP8 KV
-        int _head_dim;
-        std::tie(seq_len_kv, _head_dim) = get_shape<2>(kv_fp);
-        DG_HOST_ASSERT(head_dim == _head_dim);
-        DG_HOST_ASSERT(kv_fp.is_contiguous());
-        DG_HOST_ASSERT(kv_fp.scalar_type() == torch::kFloat8_e4m3fn);
-
-        // Check SF KV
-        auto [_seq_len_kv] = get_shape<1>(kv_sf);
-        DG_HOST_ASSERT(seq_len_kv == _seq_len_kv);
-        DG_HOST_ASSERT(kv_sf.is_contiguous());
-        DG_HOST_ASSERT(kv_sf.scalar_type() == torch::kFloat);
     }
 
     // Check KV
@@ -206,12 +165,21 @@ static torch::Tensor fp8_fp4_mqa_logits(const std::tuple<torch::Tensor, std::opt
 
     // Dispatch implementation
     if (arch_major == 10) {
-        sm100_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
-                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn or qk_dtype == kPackedFP4);
+        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
+        sm100_mqa_logits(q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
+                         seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv,
+                         is_mx_sf, qk_dtype);
     } else if (arch_major == 12) {
+        DG_HOST_ASSERT(not is_mx_sf);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
         sm120_mqa_logits(is_fp4, q_fp, q_sf, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                          seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
-    } else if (arch_major == 9 and not is_fp4) {
+    } else if (arch_major == 9) {
+        DG_HOST_ASSERT(not is_mx_sf);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
         sm90_fp8_mqa_logits(q_fp, kv_fp, kv_sf, weights, cu_seq_len_k_start, cu_seq_len_k_end, logits, logits_dtype,
                             seq_len, seq_len_kv, max_seqlen_k, stride_logits, num_heads, head_dim, block_q, block_kv);
@@ -289,17 +257,12 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
     int num_sms = device_runtime->get_num_sms();
     const auto arch_major = device_runtime->get_arch_major();
 
-    if (is_fp4) {
-        // Check FP4 Q
-        std::tie(batch_size, next_n, num_heads, head_dim) = get_shape<4>(q_fp);
-        head_dim *= 2;
-        DG_HOST_ASSERT(next_n >= 1);
-        DG_HOST_ASSERT(arch_major == 10 or arch_major == 12);
-        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
-        DG_HOST_ASSERT(head_dim == 64 or head_dim == 128);
-        DG_HOST_ASSERT(arch_major != 12 or head_dim == 128);  // SM120 FP4 paged: head_dim=128 only
-        DG_HOST_ASSERT(q_fp.is_contiguous());
-        DG_HOST_ASSERT(q_fp.scalar_type() == kPackedFP4);
+    // Check Q
+    std::tie(batch_size, next_n, num_heads, head_dim) = get_logical_shape<4>(q_fp);
+    DG_HOST_ASSERT((not is_fp4 and head_dim == 32) or head_dim == 64 or head_dim == 128);
+    DG_HOST_ASSERT(q_fp.is_contiguous());
+    DG_HOST_ASSERT(q_fp.scalar_type() == (is_fp4 ? kPackedFP4 : torch::kFloat8_e4m3fn));
+    DG_HOST_ASSERT(next_n >= 1);
 
     // Check SF Q
     if (is_mx_sf) {
@@ -309,77 +272,13 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         DG_HOST_ASSERT(batch_size == _batch_size and next_n == _next_n and num_heads == _num_heads);
         DG_HOST_ASSERT(q_sf.value().is_contiguous());
         DG_HOST_ASSERT(q_sf.value().scalar_type() == torch::kInt32);
-
-        // Check fused KV cache
-        int num_heads_kv, fp4_with_sf_bytes;
-        std::tie(num_kv_blocks, block_kv, num_heads_kv, fp4_with_sf_bytes) = get_shape<4>(fused_kv_cache);
-        DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64)) or
-                       (arch_major == 12 and block_kv == 64) or
-                       (arch_major == 9 and block_kv == 64));
-        DG_HOST_ASSERT(num_heads_kv == 1 and fp4_with_sf_bytes == head_dim / 2 + static_cast<int>(sizeof(int)));
-        DG_HOST_ASSERT(fused_kv_cache.stride(1) == fp4_with_sf_bytes and fused_kv_cache.stride(3) == 1);
-        DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
-
-        // Derive FP4 values and SF tensor
-        kv_cache_stride_bytes = fused_kv_cache.stride(0);
-        DG_HOST_ASSERT(kv_cache_stride_bytes % sizeof(int) == 0);
-        kv_cache = torch::from_blob(
-            fused_kv_cache.data_ptr(),
-            {num_kv_blocks, block_kv, head_dim / 2},
-            {kv_cache_stride_bytes, head_dim / 2, 1},
-            torch::TensorOptions().dtype(kPackedFP4)
-        );
-        kv_cache_sf = torch::from_blob(
-            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim / 2,
-            {num_kv_blocks, block_kv},
-            {kv_cache_stride_bytes / static_cast<int>(sizeof(int)), 1},
-            torch::TensorOptions().dtype(torch::kInt32)
-        );
-    } else {
-        // Check FP8 Q
-        std::tie(batch_size, next_n, num_heads, head_dim) = get_shape<4>(q_fp);
-        DG_HOST_ASSERT(next_n >= 1);
-        DG_HOST_ASSERT((arch_major == 10 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
-                       (arch_major == 12 and (num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64)) or
-                       (arch_major == 9 and (num_heads == 32 or num_heads == 64)));
-        DG_HOST_ASSERT(head_dim == 32 or head_dim == 64 or head_dim == 128);
-        DG_HOST_ASSERT(q_fp.is_contiguous());
-        DG_HOST_ASSERT(q_fp.scalar_type() == torch::kFloat8_e4m3fn);
-
-        // Check fused KV cache
-        int num_heads_kv, head_dim_with_sf;
-        std::tie(num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf) = get_shape<4>(fused_kv_cache);
-        DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64)) or
-                       (arch_major == 12 and block_kv == 64) or
-                       (arch_major == 9 and block_kv == 64));
-        DG_HOST_ASSERT(num_heads_kv == 1 and head_dim_with_sf == head_dim + static_cast<int>(sizeof(float)));
-        DG_HOST_ASSERT(fused_kv_cache.stride(1) == head_dim_with_sf and fused_kv_cache.stride(3) == 1);
-        DG_HOST_ASSERT(fused_kv_cache.scalar_type() == torch::kByte);
-
-        // Derive FP8 values and SF tensor
-        kv_cache_stride_bytes = fused_kv_cache.stride(0);
-        DG_HOST_ASSERT(kv_cache_stride_bytes % sizeof(float) == 0);
-        kv_cache = torch::from_blob(
-            fused_kv_cache.data_ptr(),
-            {num_kv_blocks, block_kv, head_dim},
-            {kv_cache_stride_bytes, head_dim, 1},
-            torch::TensorOptions().dtype(torch::kFloat8_e4m3fn)
-        );
-        kv_cache_sf = torch::from_blob(
-            fused_kv_cache.data_ptr<uint8_t>() + block_kv * head_dim,
-            {num_kv_blocks, block_kv},
-            {kv_cache_stride_bytes / static_cast<int>(sizeof(float)), 1},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        );
-
-        // Weights must be contiguous for FP8
-        DG_HOST_ASSERT(weights.is_contiguous());
     }
 
     // Check fused KV cache
     int num_heads_kv, head_dim_with_sf;
     std::tie(num_kv_blocks, block_kv, num_heads_kv, head_dim_with_sf) = get_shape<4>(fused_kv_cache);
     DG_HOST_ASSERT((arch_major == 10 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
+                   (arch_major == 12 and block_kv == 64) or
                    (arch_major == 9 and block_kv == 64));
     const int kv_head_dim = is_fp4 ? head_dim / 2 : head_dim;
     const int sf_bytes = static_cast<int>(is_mx_sf ? sizeof(int) : sizeof(float));
@@ -443,7 +342,7 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
 
     // Allocate output
     DG_HOST_ASSERT(logits_dtype == torch::kFloat32 or logits_dtype == torch::kBFloat16);
-    const int split_kv = (arch_major == 12) ? 128 : 256;  // SM120: 2 groups × 64
+    const int split_kv = (arch_major == 12) ? 128 : 256;  // SM120: 2 groups x 64
     // Logits row stride must be 1024-byte aligned
     const int stride_logits_alignment = 1024 / static_cast<int>(c10::elementSize(logits_dtype));
     const auto aligned_max_context_len = align(align(max_context_len, split_kv), stride_logits_alignment);
@@ -457,13 +356,20 @@ static torch::Tensor fp8_fp4_paged_mqa_logits(const std::tuple<torch::Tensor, st
         constexpr int splits_per_chunk = 16;
         sm100_paged_mqa_logits(q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
-                               is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk);
+                               is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk,
+                               is_mx_sf, qk_dtype);
     } else if (arch_major == 12) {
+        DG_HOST_ASSERT(not is_mx_sf);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(num_heads == 8 or num_heads == 16 or num_heads == 32 or num_heads == 64);
         constexpr int splits_per_chunk = 16;  // unused by SM120 atom scheduler
         sm120_paged_mqa_logits(is_fp4, q_fp, q_sf, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                logits_dtype, batch_size, batch_size * next_n, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
                                is_varlen, aligned_max_context_len, block_table_stride, num_sms, split_kv, splits_per_chunk);
-    } else if (arch_major == 9 and not is_fp4) {
+    } else if (arch_major == 9) {
+        DG_HOST_ASSERT(not is_mx_sf);
+        DG_HOST_ASSERT(qk_dtype == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(num_heads == 32 or num_heads == 64);
         DG_HOST_ASSERT(weights.scalar_type() == torch::kFloat);
         sm90_fp8_paged_mqa_logits(q_fp, kv_cache, kv_cache_sf, weights, context_lens, logits, block_table, indices_tensor, schedule_meta,
                                   logits_dtype, batch_size, next_n, num_heads, head_dim, num_kv_blocks, block_kv, is_context_lens_2d,
@@ -509,8 +415,10 @@ static torch::Tensor fp8_paged_mqa_logits(const torch::Tensor& q,
 }
 #endif
 
+// The source tree builds this header through the TVM-FFI API.  Keep the
+// legacy pybind registration available for the old extension build without
+// requiring pybind types in the TVM-FFI translation unit.
 #if 0
-
 static void register_apis(pybind11::module_& m) {
 #if DG_FP8_COMPATIBLE and DG_TENSORMAP_COMPATIBLE
     m.def("fp8_gemm_nt_skip_head_mid", &fp8_gemm_nt_skip_head_mid,
@@ -547,7 +455,6 @@ static void register_apis(pybind11::module_& m) {
           py::arg("indices") = std::nullopt);
 #endif
 }
-
 #endif
 
 } // namespace deep_gemm::attention

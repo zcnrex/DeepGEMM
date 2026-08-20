@@ -4,6 +4,7 @@
 
 #include <deep_gemm/common/math.cuh>
 #include <deep_gemm/common/exception.cuh>
+#include <deep_gemm/common/types.cuh>
 
 namespace deep_gemm::layout {
 
@@ -216,13 +217,9 @@ struct Workspace {
     }
 
     CUTLASS_DEVICE
-    uint32_t* get_l1_arrival_count_ptr(const uint32_t& pool_block_idx = 0) const {
-        return get_l1_full_count_ptr(pool_block_idx);
-    }
-
-    CUTLASS_DEVICE
-    uint64_t* get_l2_arrival_mask_ptr(const uint32_t& pool_block_idx = 0) const {
-        return reinterpret_cast<uint64_t*>(get_l2_full_count_ptr()) + pool_block_idx;
+    uint32_t* get_shared_l2_full_count_ptr(const uint32_t& block_idx = 0) const {
+        const auto base = get_l2_empty_count_ptr(num_ring_blocks);
+        return reinterpret_cast<uint32_t*>(base) + block_idx;
     }
 
     // For dispatch pulling
@@ -477,8 +474,9 @@ struct MegaMoEBuffer {
                   const uint32_t& num_topk,
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
-                  const bool& with_sf,
+                  const MmaKind& mma_kind,
                   const uint32_t& num_shared_experts = 0) {
+        const bool with_sf = mma_kind != MmaKind::BF16;
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -488,14 +486,15 @@ struct MegaMoEBuffer {
         const auto num_max_shared_sf_tokens = with_sf ? get_num_max_shared_sf_tokens(num_max_tokens_per_rank) : 0u;
 
         // Layouts
-        const uint32_t num_mma_elem_bytes = with_sf ? 1 : 2;
-        const auto input_token_layout = layout::Data(hidden * num_mma_elem_bytes);
+        const uint32_t elem_bits = get_element_bits(mma_kind);
+        const uint32_t gran_k = with_sf ? get_sf_gran_k(mma_kind) : 1;
+        const auto input_token_layout = layout::Data(hidden * elem_bits / 8);
         const auto bf16_token_layout = layout::Data(hidden * 2);
-        const auto intermediate_token_layout = layout::Data(intermediate_hidden * num_mma_elem_bytes);
-        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * num_mma_elem_bytes);
-        const auto input_sf_layout = layout::Data(with_sf ? hidden / 32 : 0);
-        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / 32 : 0);
-        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / 32 : 0);
+        const auto intermediate_token_layout = layout::Data(intermediate_hidden * elem_bits / 8);
+        const auto shared_intermediate_token_layout = layout::Data(shared_intermediate_hidden * elem_bits / 8);
+        const auto input_sf_layout = layout::Data(with_sf ? hidden / gran_k : 0);
+        const auto intermediate_sf_layout = layout::Data(with_sf ? intermediate_hidden / gran_k : 0);
+        const auto shared_intermediate_sf_layout = layout::Data(with_sf ? shared_intermediate_hidden / gran_k : 0);
         const auto input_topk_idx_layout = layout::Data(num_topk * sizeof(int64_t), false);
         const auto input_topk_weights_layout = layout::Data(num_topk * sizeof(float), false);
         const auto l1_topk_weights_layout = layout::Data(sizeof(float), false);
