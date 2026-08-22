@@ -464,6 +464,12 @@ struct MegaMoEBuffer {
            l2_sf_buffer,
            combine_token_buffer;
 
+    // Optional per-token FP32 outer scales for the L1 (fc13) input, applied on
+    // the L1 accumulator before activation. Appended after all other buffers
+    // so pre-existing offsets are unchanged.
+    Buffer input_x_scales_buffer,
+           l1_x_scales_buffer;
+
     CUTLASS_HOST_DEVICE
     MegaMoEBuffer(void* base,
                   const uint32_t& hidden,
@@ -549,11 +555,19 @@ struct MegaMoEBuffer {
         combine_token_buffer = Buffer(
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+
+        const auto x_scale_layout = layout::Data(sizeof(float), false);
+        input_x_scales_buffer = Buffer(
+            x_scale_layout, 1, num_max_tokens_per_rank,
+            combine_token_buffer.get_end_ptr());
+        l1_x_scales_buffer = Buffer(
+            x_scale_layout, 1, num_ring_tokens,
+            input_x_scales_buffer.get_end_ptr());
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(l1_x_scales_buffer.get_end_ptr())
                - static_cast<uint8_t*>(workspace.base);
     }
 };

@@ -34,7 +34,8 @@ static int get_block_m_for_mega_moe(
 
 static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-                                                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
+                                                    torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+                                                    torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
     const int& num_ranks, const int& num_experts,
     const int& num_max_tokens_per_rank, const int& num_topk,
@@ -162,9 +163,13 @@ get_symm_buffer_size_for_mega_moe(
             {num_sf_ring_tokens, num_sf_cols(intermediate_hidden)},
             {1, num_sf_ring_tokens},
             torch::TensorOptions().dtype(torch::kInt).device(buffer.device())) : torch::Tensor();
+        auto x_scales = torch::from_blob(
+            math::advance_ptr(buffer.data_ptr(), reinterpret_cast<int64_t>(mega_buffer.input_x_scales_buffer.base)),
+            {num_max_tokens_per_rank},
+            torch::TensorOptions().dtype(torch::kFloat32).device(buffer.device()));
         return std::make_tuple(x, x_sf, topk_idx, topk_weights,
                                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
-                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf);
+                               l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales);
     };
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
@@ -184,7 +189,8 @@ static void fp8_fp4_mega_moe(
     const std::string& mma_type,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
-    const bool& fast_math
+    const bool& fast_math,
+    const bool& use_x_scales
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -293,7 +299,7 @@ static void fp8_fp4_mega_moe(
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
-                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf, x_scales] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {
@@ -314,7 +320,7 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, swiglu_alpha, use_situ, fast_math,
-                               mma_kind);
+                               use_x_scales, mma_kind);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }
@@ -406,7 +412,7 @@ static void bf16_mega_moe(
     // Already registered tensors
     const auto [x, _x_sf, topk_idx, topk_weights,
                 shared_l1_acts, _shared_l1_acts_sf, shared_l2_acts, _shared_l2_acts_sf,
-                l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf] = slice(sym_buffer);
+                l1_acts, _l1_acts_sf, l2_acts, _l2_acts_sf, _x_scales] = slice(sym_buffer);
 
     // Dispatch into different architectures
     if (arch_major == 10) {

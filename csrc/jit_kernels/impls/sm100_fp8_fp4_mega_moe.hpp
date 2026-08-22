@@ -28,6 +28,7 @@ public:
         float swiglu_alpha;
         bool use_situ;
         bool fast_math;
+        bool use_x_scales;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -84,6 +85,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -103,7 +105,8 @@ static void __instantiate_kernel() {{
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp), to_string(args.swiglu_alpha),
     args.use_situ ? "true" : "false",
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.use_x_scales ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -156,6 +159,7 @@ static void sm100_fp8_fp4_mega_moe(
     const float& swiglu_alpha,
     const bool& use_situ,
     const bool& fast_math,
+    const bool& use_x_scales,
     const MmaKind& mma_kind
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -303,6 +307,7 @@ static void sm100_fp8_fp4_mega_moe(
         .swiglu_alpha = swiglu_alpha,
         .use_situ = use_situ,
         .fast_math = fast_math,
+        .use_x_scales = use_x_scales,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

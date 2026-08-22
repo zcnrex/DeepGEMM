@@ -59,7 +59,8 @@ class SymmBuffer:
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
-         self.l2_acts, self.l2_acts_sf) = map(
+         self.l2_acts, self.l2_acts_sf,
+         self.x_scales) = map(
             torch.from_dlpack, slice_input_buffers(self.buffer))
 
     def destroy(self):
@@ -183,7 +184,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      recipe: Tuple[int, int, int] = (1, 1, 32),
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
-                     fast_math: bool = True):
+                     fast_math: bool = True,
+                     use_x_scales: bool = False):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     (shared_l1_data, shared_l1_sf) = shared_l1_weights if shared_l1_weights is not None else (None, None)
@@ -201,7 +203,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math
+        fast_math, use_x_scales
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -213,15 +215,18 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                    activation: str = 'swiglu',
                    activation_clamp: Optional[float] = None,
-                   fast_math: bool = True):
-    # NOTES: NVFP4 is the same entry point with a per-16 SF granularity
+                   fast_math: bool = True,
+                   use_x_scales: bool = False):
+    # NOTES: NVFP4 is the same entry point with a per-16 SF granularity.
+    # `use_x_scales` applies `sym_buffer.x_scales` (per-token FP32 outer scales
+    # for the L1/fc13 input) on the L1 accumulator before activation.
     fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         recipe=(1, 1, 16),
         activation=activation, activation_clamp=activation_clamp,
-        fast_math=fast_math
+        fast_math=fast_math, use_x_scales=use_x_scales
     )
 
 

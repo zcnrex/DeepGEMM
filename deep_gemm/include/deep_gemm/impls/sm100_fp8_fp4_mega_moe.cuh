@@ -38,6 +38,7 @@ template <
     float kSwiGLUAlpha,
     bool kUseSitu,
     bool kFastMath,
+    bool kUseXScales,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -609,6 +610,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     current_rank_in_expert_idx);
                 *buffer.l1_topk_weights_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = weight;
 
+                if constexpr (kUseXScales) {
+                    const auto x_scale = *sym_buffer.map(
+                        buffer.input_x_scales_buffer.get_base_ptr<float>() + src_token_idx,
+                        current_rank_in_expert_idx);
+                    *buffer.l1_x_scales_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).template get_base_ptr<float>() = x_scale;
+                }
+
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
@@ -1033,6 +1041,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Unified L1 epilogue: SwiGLU in-place using granularity 8 interleaved weights
                 // With `SM100_TMEM_LOAD_16dp256b1x`, gate/up pairs are:
                 float stored_cached_weight = 1.0f;
+                float stored_cached_x_scale = 1.0f;
 
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
@@ -1058,6 +1067,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 .get_data_buffer(ring_m_idx + epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx)
                                 .template get_base_ptr<float>();
                         }
+
+                        // Per-token L1 input outer scales, cached like the topk weights.
+                        // Routed rows read the ring copy made at dispatch; shared rows
+                        // read the local input scales directly.
+                        if constexpr (kUseXScales) {
+                            if ((j * ATOM_M) % 32 == 0 and
+                                (WG_BLOCK_M % 32 == 0 or j * ATOM_M + lane_idx < WG_BLOCK_M)) {
+                                const uint32_t row = epilogue_wg_idx * WG_BLOCK_M + j * ATOM_M + lane_idx;
+                                stored_cached_x_scale = task_info.is_shared() ?
+                                    *buffer.input_x_scales_buffer.get_data_buffer(m_idx + row).template get_base_ptr<float>() :
+                                    *buffer.l1_x_scales_buffer.get_data_buffer(ring_m_idx + row).template get_base_ptr<float>();
+                            }
+                        }
+                        const float2 x_scales = kUseXScales ? float2{
+                            ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
+                            ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
+                        } : float2{1.0f, 1.0f};
 
                         // Load weights from register cache
                         const float2 weights = {
@@ -1090,6 +1116,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
+                            if constexpr (kUseXScales) {
+                                fp32_values[k * 2 + 0] = __fmul2_rn(fp32_values[k * 2 + 0], x_scales);
+                                fp32_values[k * 2 + 1] = __fmul2_rn(fp32_values[k * 2 + 1], x_scales);
+                            }
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
                             auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
 
