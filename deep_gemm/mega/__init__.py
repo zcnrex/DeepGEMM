@@ -185,7 +185,8 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
-                     use_x_scales: bool = False):
+                     use_x_scales: bool = False,
+                     l1_alphas: Optional[torch.Tensor] = None):
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     (shared_l1_data, shared_l1_sf) = shared_l1_weights if shared_l1_weights is not None else (None, None)
@@ -203,7 +204,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math, use_x_scales
+        fast_math, use_x_scales, l1_alphas
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -216,7 +217,8 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    activation: str = 'swiglu',
                    activation_clamp: Optional[float] = None,
                    fast_math: bool = True,
-                   use_x_scales: bool = False):
+                   use_x_scales: bool = False,
+                   l1_alphas: Optional[torch.Tensor] = None):
     # NOTES: NVFP4 is the same entry point with a per-16 SF granularity.
     # `use_x_scales` applies `sym_buffer.x_scales` (per-token FP32 outer scales
     # for the L1/fc13 input) on the L1 accumulator before activation.
@@ -226,7 +228,7 @@ def nvfp4_mega_moe(y: torch.Tensor,
         cumulative_local_expert_recv_stats,
         recipe=(1, 1, 16),
         activation=activation, activation_clamp=activation_clamp,
-        fast_math=fast_math, use_x_scales=use_x_scales
+        fast_math=fast_math, use_x_scales=use_x_scales, l1_alphas=l1_alphas
     )
 
 
@@ -267,11 +269,14 @@ def mega_moe_pre_dispatch(x: torch.Tensor,
                           buf_topk_weights: torch.Tensor,
                           num_tokens: int,
                           group_size: int = 32,
-                          use_fp4_acts: bool = False) -> None:
+                          mma_type: str = 'fp8xfp4',
+                          buf_x_scales: Optional[torch.Tensor] = None,
+                          expert_scales: Optional[torch.Tensor] = None) -> None:
     _C.mega_moe_pre_dispatch(
         x, topk_idx, topk_weights,
         buf_x, buf_x_sf, buf_topk_idx, buf_topk_weights,
-        num_tokens, group_size, use_fp4_acts,
+        num_tokens, group_size, mma_type,
+        buf_x_scales, expert_scales,
     )
 
 

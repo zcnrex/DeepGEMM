@@ -737,7 +737,7 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
                         Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                         int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                         Tuple<int64_t, int64_t, int64_t> recipe, std::string mma_type, std::string activation, Optional<double> activation_clamp_opt,
-                        bool fast_math, bool use_x_scales) {
+                        bool fast_math, bool use_x_scales, Optional<TensorView> l1_alphas) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -768,7 +768,8 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
         c_val, convert_to_torch_tensor(sym_buffer), sym_buffer_ptrs_val, static_cast<int>(rank_idx),
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
         static_cast<int>(num_topk), recipe_val, mma_type, activation, act_clamp_opt_val, fast_math,
-        use_x_scales
+        use_x_scales,
+        l1_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value())) : std::nullopt
     );
 }
 
@@ -831,7 +832,8 @@ void dg_mega_moe_pre_dispatch(
     TensorView x, TensorView topk_idx, TensorView topk_weights,
     TensorView buf_x, TensorView buf_x_sf,
     TensorView buf_topk_idx, TensorView buf_topk_weights,
-    int64_t num_tokens, int64_t group_size, bool use_fp4_acts) {
+    int64_t num_tokens, int64_t group_size, std::string mma_type,
+    Optional<TensorView> buf_x_scales, Optional<TensorView> expert_scales) {
     mega_moe_pre_dispatch(
         convert_to_torch_tensor(x),
         convert_to_torch_tensor(topk_idx),
@@ -842,7 +844,13 @@ void dg_mega_moe_pre_dispatch(
         convert_to_torch_tensor(buf_topk_weights),
         static_cast<int>(num_tokens),
         static_cast<int>(group_size),
-        use_fp4_acts
+        mma_type,
+        buf_x_scales.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(buf_x_scales.value()))
+            : std::nullopt,
+        expert_scales.has_value()
+            ? std::optional<torch::Tensor>(convert_to_torch_tensor(expert_scales.value()))
+            : std::nullopt
     );
 }
 
