@@ -134,7 +134,8 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         cast_grouped(l2_local, [torch.ones(hidden, device='cuda')] * num_local_experts),
         'swiglu', 'nvfp4xnvfp4')
 
-    def run(weights, l1_alphas=None, l2_alphas=None, expert_scales=None, tw=None):
+    def run(weights, l1_alphas=None, l2_alphas=None, expert_scales=None, tw=None,
+            l2_act_scales=None):
         deep_gemm.mega_moe_pre_dispatch(
             x, topk_idx, topk_weights if tw is None else tw,
             buffer.x, buffer.x_sf, buffer.topk_idx, buffer.topk_weights,
@@ -144,7 +145,9 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
         deep_gemm.fp8_fp4_mega_moe(
             y=y, l1_weights=weights[0], l2_weights=weights[1], sym_buffer=buffer,
             recipe=(1, 1, GRAN_K), activation='swiglu', fast_math=bool(args.fast_math),
-            use_x_scales=True, l1_alphas=l1_alphas, l2_alphas=l2_alphas)
+            # The NVFP4 wrapper must select per-token x scales by default.
+            l1_alphas=l1_alphas, l2_alphas=l2_alphas,
+            l2_act_scales=l2_act_scales)
         dist.barrier()
         torch.cuda.synchronize()
         return y
@@ -186,6 +189,30 @@ def test(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
             assert not torch.equal(y_scaled, run(scaled, *wrong)), \
                 f'[{tag}] rolling `{name}` changed nothing — the kernel ignores it'
         dist_print(f' > [{tag}] roll-by-one control: both tables have teeth', once_in_node=True)
+
+    # `l2_act_scales` (LOCAL index): pow2 fc2 input gs is cancelled by `1/gs`
+    # in `l2_alphas`. Damp x so the scaled block SFs stay under E4M3's 448
+    # satfinite ceiling. Exact pow2 invariance still breaks for blocks whose SF
+    # lands in E4M3's SUBNORMAL range (absolute 2**-9 grid, not scale
+    # invariant): a re-rounded SF moves single FP4 codes, perturbing outputs by
+    # at most ~1 BF16 ulp of the tensor scale. Bound accordingly, not bitwise.
+    x = (x.float() * 0.25).bfloat16()
+    y_damped = run(base_w)
+    gs_in = torch.pow(2.0, (torch.arange(num_local_experts, device='cuda',
+                                         dtype=torch.float) % 3))
+    y_gs = run(base_w, l2_alphas=(1.0 / gs_in).contiguous(),
+               l2_act_scales=gs_in.contiguous())
+    d = (y_gs.float() - y_damped.float()).abs()
+    tol = torch.finfo(torch.bfloat16).eps * y_damped.float().abs().max()
+    rel = (d.norm() / y_damped.float().norm()).item()
+    assert d.max() <= tol and rel < 1e-3, \
+        f'l2_act_scales cancellation off: max |d| {d.max().item():.3e} ' \
+        f'(tol {tol.item():.3e}), rel-L2 {rel:.3e}'
+    assert not torch.equal(y_damped, run(base_w, l2_act_scales=gs_in.contiguous())), \
+        'l2_act_scales alone changed nothing -- the kernel ignores it'
+    dist_print(f' > l2_act_scales: pow2 gs cancels to 1 tensor-scale ulp '
+               f'(max |d| {d.max().item():.2e}, rel {rel:.1e}), teeth ok',
+               once_in_node=True)
 
     # `expert_scales`, GLOBAL index space: folding an O(1) per-expert ratio in the
     # kernel must equal folding it into `topk_weights` on the host. Bitwise —
