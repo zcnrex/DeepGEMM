@@ -114,6 +114,7 @@ static void mega_moe_pre_dispatch(
     if (expert_scales.has_value()) {
         DG_HOST_ASSERT(expert_scales->scalar_type() == torch::kFloat);
         DG_HOST_ASSERT(expert_scales->is_contiguous());
+        DG_HOST_ASSERT(expert_scales->dim() == 1);
     }
     DG_HOST_ASSERT(x.scalar_type() == torch::kBFloat16);
     DG_HOST_ASSERT(x.is_contiguous());

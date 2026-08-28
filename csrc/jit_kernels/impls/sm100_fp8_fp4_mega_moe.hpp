@@ -29,11 +29,17 @@ public:
         bool use_situ;
         bool fast_math;
         bool use_x_scales;
+        bool with_l1_alphas;
+        bool with_l2_alphas;
+        bool with_l2_act_scales;
         MegaMoEConfig config;
 
         // Runtime arguments
         void* y;
         int* cumulative_local_expert_recv_stats;
+        const float* l1_alphas;
+        const float* l2_alphas;
+        const float* l2_act_scales;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
 
@@ -86,7 +92,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
-        {}
+        {}, {}, {}, {}
     >);
 }};
 )", args.num_max_tokens_per_rank,
@@ -106,7 +112,10 @@ static void __instantiate_kernel() {{
     to_string(args.activation_clamp), to_string(args.swiglu_alpha),
     args.use_situ ? "true" : "false",
     args.fast_math ? "true" : "false",
-    args.use_x_scales ? "true" : "false");
+    args.use_x_scales ? "true" : "false",
+    args.with_l1_alphas ? "true" : "false",
+    args.with_l2_alphas ? "true" : "false",
+    args.with_l2_act_scales ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -114,6 +123,9 @@ static void __instantiate_kernel() {{
         DG_CUDA_UNIFIED_CHECK(launch_kernel(kernel, config,
             args.y,
             args.cumulative_local_expert_recv_stats,
+            args.l1_alphas,
+            args.l2_alphas,
+            args.l2_act_scales,
             args.num_tokens,
             args.sym_buffer_ptrs,
             args.tensor_map_l1_acts,
@@ -160,6 +172,9 @@ static void sm100_fp8_fp4_mega_moe(
     const bool& use_situ,
     const bool& fast_math,
     const bool& use_x_scales,
+    const float* l1_alphas,
+    const float* l2_alphas,
+    const float* l2_act_scales,
     const MmaKind& mma_kind
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -308,9 +323,15 @@ static void sm100_fp8_fp4_mega_moe(
         .use_situ = use_situ,
         .fast_math = fast_math,
         .use_x_scales = use_x_scales,
+        .with_l1_alphas = l1_alphas != nullptr,
+        .with_l2_alphas = l2_alphas != nullptr,
+        .with_l2_act_scales = l2_act_scales != nullptr,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
+        .l1_alphas = l1_alphas,
+        .l2_alphas = l2_alphas,
+        .l2_act_scales = l2_act_scales,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
         .tensor_map_l1_acts = tensor_map_l1_acts,

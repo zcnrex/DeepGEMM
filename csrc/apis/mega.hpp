@@ -190,7 +190,10 @@ static void fp8_fp4_mega_moe(
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math,
-    const bool& use_x_scales
+    const bool& use_x_scales,
+    const std::optional<torch::Tensor>& l1_alphas,
+    const std::optional<torch::Tensor>& l2_alphas,
+    const std::optional<torch::Tensor>& l2_act_scales
 ) {
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -210,6 +213,7 @@ static void fp8_fp4_mega_moe(
         DG_HOST_UNREACHABLE("recipe K granularity " + std::to_string(rk) + " does not match `" +
                             mma_type + "` (expected " +
                             std::to_string(get_sf_gran_k(mma_kind)) + ")");
+    DG_HOST_ASSERT(use_x_scales == (mma_kind == MmaKind::NVFP4));
     DG_HOST_ASSERT(activation == "swiglu" or activation == "swigluoai" or
                    (mma_kind == MmaKind::MXFP8FP4 and activation == "situ"));
     DG_HOST_ASSERT(activation != "situ" or not activation_clamp_opt.has_value());
@@ -296,6 +300,32 @@ static void fp8_fp4_mega_moe(
                             std::to_string(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
+    if (l1_alphas.has_value()) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
+        DG_HOST_ASSERT(l1_alphas->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(l1_alphas->is_contiguous());
+        DG_HOST_ASSERT(l1_alphas->dim() == 2);
+        DG_HOST_ASSERT(l1_alphas->size(0) == num_experts_per_rank);
+        DG_HOST_ASSERT(l1_alphas->size(1) == 2);
+    }
+
+    if (l2_alphas.has_value()) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
+        DG_HOST_ASSERT(l2_alphas->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(l2_alphas->is_contiguous());
+        DG_HOST_ASSERT(l2_alphas->dim() == 1);
+        DG_HOST_ASSERT(l2_alphas->size(0) == num_experts_per_rank);
+    }
+
+    // Per-expert fc2 input global scales, `[num_experts_per_rank]` FP32
+    if (l2_act_scales.has_value()) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::NVFP4);
+        DG_HOST_ASSERT(l2_act_scales->scalar_type() == torch::kFloat);
+        DG_HOST_ASSERT(l2_act_scales->is_contiguous());
+        DG_HOST_ASSERT(l2_act_scales->dim() == 1);
+        DG_HOST_ASSERT(l2_act_scales->size(0) == num_experts_per_rank);
+    }
+
     // Already registered tensors
     const auto [x, x_sf, topk_idx, topk_weights,
                 shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
@@ -320,7 +350,14 @@ static void fp8_fp4_mega_moe(
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
                                activation_clamp, swiglu_alpha, use_situ, fast_math,
-                               use_x_scales, mma_kind);
+                               use_x_scales,
+                               l1_alphas.has_value()
+                                   ? l1_alphas->const_data_ptr<float>() : nullptr,
+                               l2_alphas.has_value()
+                                   ? l2_alphas->const_data_ptr<float>() : nullptr,
+                               l2_act_scales.has_value()
+                                   ? l2_act_scales->const_data_ptr<float>() : nullptr,
+                               mma_kind);
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

@@ -185,8 +185,22 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True,
-                     use_x_scales: bool = False,
-                     l1_alphas: Optional[torch.Tensor] = None):
+                     use_x_scales: Optional[bool] = None,
+                     l1_alphas: Optional[torch.Tensor] = None,
+                     l2_alphas: Optional[torch.Tensor] = None,
+                     l2_act_scales: Optional[torch.Tensor] = None):
+    # NVFP4 activations always have a per-token FP32 outer scale.  Derive the
+    # only valid setting from the buffer type so a default call cannot silently
+    # discard that scale (or read an uninitialized scale buffer for other MMAs).
+    uses_nvfp4 = sym_buffer.mma_type == 'nvfp4xnvfp4'
+    if use_x_scales is None:
+        use_x_scales = uses_nvfp4
+    elif use_x_scales != uses_nvfp4:
+        raise ValueError(
+            '`use_x_scales` must be enabled exactly for `nvfp4xnvfp4`; '
+            f'got {use_x_scales=} with mma_type={sym_buffer.mma_type!r}'
+        )
+
     (l1_weights_data, l1_weights_sf) = l1_weights
     (l2_weights_data, l2_weights_sf) = l2_weights
     (shared_l1_data, shared_l1_sf) = shared_l1_weights if shared_l1_weights is not None else (None, None)
@@ -204,7 +218,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe, sym_buffer.mma_type,
         activation, activation_clamp,
-        fast_math, use_x_scales, l1_alphas
+        fast_math, use_x_scales, l1_alphas, l2_alphas, l2_act_scales
     )
 
 def nvfp4_mega_moe(y: torch.Tensor,
@@ -217,18 +231,18 @@ def nvfp4_mega_moe(y: torch.Tensor,
                    activation: str = 'swiglu',
                    activation_clamp: Optional[float] = None,
                    fast_math: bool = True,
-                   use_x_scales: bool = False,
-                   l1_alphas: Optional[torch.Tensor] = None):
-    # NOTES: NVFP4 is the same entry point with a per-16 SF granularity.
-    # `use_x_scales` applies `sym_buffer.x_scales` (per-token FP32 outer scales
-    # for the L1/fc13 input) on the L1 accumulator before activation.
+                   use_x_scales: Optional[bool] = None,
+                   l1_alphas: Optional[torch.Tensor] = None,
+                   l2_alphas: Optional[torch.Tensor] = None,
+                   l2_act_scales: Optional[torch.Tensor] = None):
     fp8_fp4_mega_moe(
         y, l1_weights, l2_weights, sym_buffer,
         shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         recipe=(1, 1, 16),
         activation=activation, activation_clamp=activation_clamp,
-        fast_math=fast_math, use_x_scales=use_x_scales, l1_alphas=l1_alphas
+        fast_math=fast_math, use_x_scales=use_x_scales,
+        l1_alphas=l1_alphas, l2_alphas=l2_alphas, l2_act_scales=l2_act_scales
     )
 
 

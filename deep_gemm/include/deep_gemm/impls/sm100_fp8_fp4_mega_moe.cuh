@@ -39,6 +39,9 @@ template <
     bool kUseSitu,
     bool kFastMath,
     bool kUseXScales,
+    bool kWithL1Alphas,
+    bool kWithL2Alphas,
+    bool kWithL2ActScales,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -59,6 +62,9 @@ template <
 CUTLASS_GLOBAL __launch_bounds__(kNumThreads, 1) void
 sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
+                            const float* __restrict__ l1_alphas,
+                            const float* __restrict__ l2_alphas,
+                            const float* __restrict__ l2_act_scales,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
@@ -1043,6 +1049,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 float stored_cached_weight = 1.0f;
                 float stored_cached_x_scale = 1.0f;
 
+                float2 l1_alpha = {1.0f, 1.0f};
+                if constexpr (kWithL1Alphas) {
+                    if (not task_info.is_shared())
+                        l1_alpha = __ldg(reinterpret_cast<const float2*>(l1_alphas) +
+                                         task_info.local_expert_idx);
+                }
+
+                // fc2 input global scale; the caller folds the inverse into `l2_alphas`
+                float l2_act_gs = 1.0f;
+                if constexpr (kWithL2ActScales) {
+                    if (not task_info.is_shared())
+                        l2_act_gs = __ldg(l2_act_scales + task_info.local_expert_idx);
+                }
+
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     // Early break if the entire store block is beyond the valid token range
@@ -1084,12 +1104,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                             ptx::exchange(stored_cached_x_scale, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         } : float2{1.0f, 1.0f};
+                        const float2 gate_scales = kWithL1Alphas ?
+                            __fmul2_rn(x_scales, {l1_alpha.x, l1_alpha.x}) : x_scales;
+                        const float2 up_scales = kWithL1Alphas ?
+                            __fmul2_rn(x_scales, {l1_alpha.y, l1_alpha.y}) : x_scales;
 
                         // Load weights from register cache
-                        const float2 weights = {
+                        float2 weights = {
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 0),
                             ptx::exchange(stored_cached_weight, (j * ATOM_M) % 32 + (lane_idx % 4) * 2 + 1)
                         };
+                        if constexpr (kWithL2ActScales)
+                            weights = __fmul2_rn(weights, {l2_act_gs, l2_act_gs});
 
                         // Load from TMEM
                         uint2 raw_values[4];
@@ -1116,9 +1142,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         auto fp32_values = reinterpret_cast<float2*>(raw_values);
                         #pragma unroll
                         for (uint32_t k = 0; k < 2; ++ k) {
-                            if constexpr (kUseXScales) {
-                                fp32_values[k * 2 + 0] = __fmul2_rn(fp32_values[k * 2 + 0], x_scales);
-                                fp32_values[k * 2 + 1] = __fmul2_rn(fp32_values[k * 2 + 1], x_scales);
+                            if constexpr (kUseXScales or kWithL1Alphas) {
+                                fp32_values[k * 2 + 0] = __fmul2_rn(fp32_values[k * 2 + 0], gate_scales);
+                                fp32_values[k * 2 + 1] = __fmul2_rn(fp32_values[k * 2 + 1], up_scales);
                             }
                             auto bf16_gate = __float22bfloat162_rn(fp32_values[k * 2 + 0]);
                             auto bf16_up =   __float22bfloat162_rn(fp32_values[k * 2 + 1]);
@@ -1317,6 +1343,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
 
+                float l2_alpha = 1.0f;
+                if constexpr (kWithL2Alphas) {
+                    if (not task_info.is_shared())
+                        l2_alpha = __ldg(l2_alphas + task_info.local_expert_idx);
+                }
+
                 // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
@@ -1339,6 +1371,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         cute::SM100_TMEM_LOAD_16dp256b1x::copy(tmem_addr | 0x00100000,
                                                                values[4], values[5], values[6], values[7]);
                         cutlass::arch::fence_view_async_tmem_load();
+
+                        if constexpr (kWithL2Alphas) {
+                            auto fp32_values = reinterpret_cast<float*>(values);
+                            #pragma unroll
+                            for (uint32_t v = 0; v < ATOM_M; ++ v)
+                                fp32_values[v] *= l2_alpha;
+                        }
 
                         // Wait shared memory release from previous NVLink store
                         // NOTES: skip for the first store block since the prior full barrier already ensures completion

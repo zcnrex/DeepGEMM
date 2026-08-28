@@ -737,7 +737,8 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
                         Optional<TensorView> cumulative_local_expert_recv_stats, TensorView sym_buffer, Array<int64_t> sym_buffer_ptrs,
                         int64_t rank_idx, int64_t num_max_tokens_per_rank, int64_t num_experts, int64_t num_topk,
                         Tuple<int64_t, int64_t, int64_t> recipe, std::string mma_type, std::string activation, Optional<double> activation_clamp_opt,
-                        bool fast_math, bool use_x_scales, Optional<TensorView> l1_alphas) {
+                        bool fast_math, bool use_x_scales, Optional<TensorView> l1_alphas,
+                        Optional<TensorView> l2_alphas, Optional<TensorView> l2_act_scales) {
     auto c_val = cumulative_local_expert_recv_stats.has_value()? std::optional<torch::Tensor>(convert_to_torch_tensor(cumulative_local_expert_recv_stats.value())) : std::nullopt;
     auto act_clamp_opt_val = activation_clamp_opt.has_value()? std::optional<float>(static_cast<float>(activation_clamp_opt.value())) : std::nullopt;
     std::vector<int64_t> sym_buffer_ptrs_val;
@@ -769,7 +770,9 @@ void dg_fp8_fp4_mega_moe(TensorView y, TensorView l1_weights, TensorView l1_weig
         static_cast<int>(num_max_tokens_per_rank), static_cast<int>(num_experts),
         static_cast<int>(num_topk), recipe_val, mma_type, activation, act_clamp_opt_val, fast_math,
         use_x_scales,
-        l1_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value())) : std::nullopt
+        l1_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l1_alphas.value())) : std::nullopt,
+        l2_alphas.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_alphas.value())) : std::nullopt,
+        l2_act_scales.has_value() ? std::optional<torch::Tensor>(convert_to_torch_tensor(l2_act_scales.value())) : std::nullopt
     );
 }
 
